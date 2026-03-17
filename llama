@@ -556,24 +556,24 @@ mode_history() {
 }
 
 # ── Chat mode ──────────────────────────────────────────────────────────────
+#  Uses a manual turn-by-turn loop so all messages stay in the terminal's
+#  normal scrollback buffer — scroll up any time with your terminal's
+#  scroll or Shift+PgUp / mouse wheel.
 
 mode_chat() {
   show_header
   pick_model || return
   session_bar
 
-  printf '  %s%sStarting conversation%s  %s%s%s\n\n' \
+  printf '  %s%sChat started%s  %s%s%s\n' \
     "$W" "$BOLD" "$RST" "$G" "$(basename "$CHOSEN_MODEL")" "$RST"
-  printf '  %sCtrl+C%s exits the conversation\n\n' "$W" "$RST"
+  printf '  %sScroll up any time to read previous messages%s\n' "$G" "$RST"
+  printf '  %sLeave input empty and press Enter to end the chat%s\n\n' "$D" "$RST"
   hr '─' "$D"
   echo ""
 
-  if [[ -t 0 ]]; then
-    "$LLAMA_BIN" \
-      -m  "$CHOSEN_MODEL" \
-      --gpu-layers "$GPU_LAYERS" \
-      --conversation
-  else
+  # Handle piped (non-interactive) input the same way as before
+  if [[ ! -t 0 ]]; then
     local piped; piped=$(cat)
     spinner_start "Analyzing piped input…"
     "$LLAMA_BIN" \
@@ -582,13 +582,91 @@ mode_chat() {
       -p  "Review this and explain any issues:\n${piped}" \
       -n  500
     spinner_stop
+    echo ""
+    hr '─' "$D"
+    save_history "chat" "$CHOSEN_MODEL" \
+      "Piped session on $(date '+%Y-%m-%d %H:%M:%S')"
+    info "Session saved to history"
+    echo ""
+    read -rp "  Press Enter to go back…" </dev/tty
+    return
   fi
 
-  echo ""
-  hr '─' "$D"
-  save_history "chat" "$CHOSEN_MODEL" \
-    "Interactive session on $(date '+%Y-%m-%d %H:%M:%S')"
-  info "Session saved to history"
+  # Accumulated context for multi-turn coherence
+  local context=""
+  local history_log=""
+  local turn=0
+
+  while true; do
+    printf '  %s%sYou:%s ' "$B1" "$BOLD" "$RST"
+    local user_input
+    IFS= read -r user_input </dev/tty
+
+    # Empty input → end chat
+    [[ -z "$user_input" ]] && break
+
+    (( turn++ ))
+
+    # Build prompt — grow context each turn so the model remembers
+    local prompt
+    if [[ -z "$context" ]]; then
+      prompt="### Human: ${user_input}
+### Assistant:"
+    else
+      prompt="${context}
+### Human: ${user_input}
+### Assistant:"
+    fi
+
+    # Simple static indicator — no background spinner that fights with llama output
+    printf '  %s…%s\n' "$G" "$RST"
+
+    local tmpout; tmpout=$(mktemp /tmp/llama_out_XXXX)
+    "$LLAMA_BIN" \
+      -m  "$CHOSEN_MODEL" \
+      --gpu-layers "$GPU_LAYERS" \
+      -p  "$prompt" \
+      -n  600 \
+      --no-display-prompt \
+      --log-disable \
+      > "$tmpout" 2>/dev/null || true
+
+    # Extract only the text that follows the last "### Assistant:" marker.
+    # Everything before it (banner, build info, prompt echo) is discarded.
+    local response
+    response=$(awk '/### Assistant:/{found=1; buf=""; next} found{buf=(buf ? buf"\n" : "")$0} END{print buf}' "$tmpout" \
+      | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+    rm -f "$tmpout"
+    [[ -z "$response" ]] && response="[model returned no output]"
+
+    # Erase the "…" line
+    printf '\033[A\033[2K'
+
+    # Strip leading/trailing whitespace
+    response=$(printf '%s' "$response" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+    context="${prompt}${response}"
+
+    # Print AI response (user input is already visible above — don't reprint it)
+    printf '  %s%sAI:%s\n\n' "$GRN" "$BOLD" "$RST"
+    local ww=$(( $(tw) - 4 ))
+    while IFS= read -r line; do
+      printf '  %s\n' "$line"
+    done < <(printf '%s\n' "$response" | fold -s -w "$ww")
+    echo ""
+    hr '─' "$D"
+    echo ""
+
+    history_log+="$(printf '— Turn %d —\nYou: %s\n\nAI: %s\n\n' \
+      "$turn" "$user_input" "$response")"
+  done
+
+  if [[ $turn -gt 0 ]]; then
+    save_history "chat" "$CHOSEN_MODEL" "$history_log"
+    info "Session saved to history"
+  else
+    info "No messages sent — nothing saved."
+  fi
   echo ""
   read -rp "  Press Enter to go back…" </dev/tty
 }
@@ -943,6 +1021,9 @@ main() {
 
   show_header
   show_startup_panels
+
+  echo ""
+  read -rp "  Press Enter to continue…" </dev/tty
 
   while true; do
     show_header
